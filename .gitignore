@@ -1,0 +1,6 @@
+__pycache__/
+frames/
+frames_smoke/
+paper/
+*.pyc
+*.tgz
