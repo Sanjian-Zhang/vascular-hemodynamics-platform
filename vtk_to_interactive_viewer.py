@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import argparse
 from collections import defaultdict
 import heapq
 import json
@@ -8,8 +9,8 @@ from pathlib import Path
 import numpy as np
 
 
-VTK_FILE = Path(__file__).with_name("lc_3.vtk")
-OUT_HTML = Path(__file__).with_name("lc_3_interactive_velocity_viewer.html")
+DEFAULT_VTK_FILE = Path(__file__).with_name("lc_3.vtk")
+DEFAULT_OUT_HTML = Path(__file__).with_name("lc_3_interactive_velocity_viewer.html")
 
 
 def read_legacy_vtk_polydata(path: Path):
@@ -118,6 +119,11 @@ def build_segments(
     for cell_index, ids in enumerate(cells):
         if len(ids) < 2:
             continue
+        polyline_points = points_raw[ids]
+        path_segments = np.diff(polyline_points, axis=0)
+        cell_path_length = float(np.sum(np.linalg.norm(path_segments, axis=1)))
+        chord_length = float(np.linalg.norm(polyline_points[-1] - polyline_points[0]))
+        tortuosity = cell_path_length / chord_length if chord_length > 1e-9 else 1.0
         signed_velocity = float(velocity[cell_index])
         speed = abs(signed_velocity)
         cell_radius = float(radius_um[cell_index])
@@ -131,12 +137,13 @@ def build_segments(
             pa = points_raw[a]
             pb = points_raw[b]
             length_raw = float(np.linalg.norm(pb - pa))
-            pressure_a = float(point_pressure[a]) if point_pressure is not None else 0.0
-            pressure_b = float(point_pressure[b]) if point_pressure is not None else 0.0
+            pressure_a = float(point_pressure[a]) if point_pressure is not None else None
+            pressure_b = float(point_pressure[b]) if point_pressure is not None else None
             segments.append(
                 {
                     "a": int(a),
                     "b": int(b),
+                    "cell_index": int(cell_index),
                     "velocity": signed_velocity,
                     "speed": speed,
                     "flow": signed_flow,
@@ -146,11 +153,29 @@ def build_segments(
                     "shear_stress": cell_shear,
                     "pressure_a": pressure_a,
                     "pressure_b": pressure_b,
-                    "pressure_drop": pressure_a - pressure_b,
+                    "pressure_drop": None if pressure_a is None or pressure_b is None else pressure_a - pressure_b,
                     "length_raw": length_raw,
+                    "path_length_raw": cell_path_length,
+                    "straight_length_raw": chord_length,
+                    "tortuosity": tortuosity,
                 }
             )
     return segments
+
+
+def compute_segment_midpoints(points_raw: np.ndarray, cells):
+    midpoints = []
+    lengths = []
+    for ids in cells:
+        if len(ids) < 2:
+            continue
+        pa = points_raw[ids[0]]
+        pb = points_raw[ids[-1]]
+        midpoints.append((pa + pb) * 0.5)
+        lengths.append(float(np.linalg.norm(pb - pa)))
+    if not midpoints:
+        return np.empty((0, 3), dtype=float), np.empty((0,), dtype=float)
+    return np.vstack(midpoints), np.array(lengths, dtype=float)
 
 
 def build_adjacency(segments):
@@ -162,6 +187,145 @@ def build_adjacency(segments):
         adjacency[a].append((b, w, idx))
         adjacency[b].append((a, w, idx))
     return adjacency
+
+
+def assign_strand_metrics(points_raw: np.ndarray, segments):
+    incident_edges = defaultdict(list)
+    for edge_index, seg in enumerate(segments):
+        incident_edges[seg["a"]].append(edge_index)
+        incident_edges[seg["b"]].append(edge_index)
+
+    degrees = {node: len(edges) for node, edges in incident_edges.items()}
+    visited_edges = set()
+
+    def other_node(edge_index: int, node: int):
+        seg = segments[edge_index]
+        return seg["b"] if seg["a"] == node else seg["a"]
+
+    def apply_metrics(node_indices, edge_indices):
+        if len(node_indices) < 2 or not edge_indices:
+            return
+        path_length = float(sum(segments[edge_index]["length_raw"] for edge_index in edge_indices))
+        chord_length = float(np.linalg.norm(points_raw[node_indices[-1]] - points_raw[node_indices[0]]))
+        tortuosity = path_length / chord_length if chord_length > 1e-9 else 1.0
+        for edge_index in edge_indices:
+            segments[edge_index]["path_length_raw"] = path_length
+            segments[edge_index]["straight_length_raw"] = chord_length
+            segments[edge_index]["tortuosity"] = tortuosity
+
+    def walk_from_anchor(start_node: int, first_edge: int):
+        node_indices = [start_node]
+        edge_indices = []
+        current_node = start_node
+        edge_index = first_edge
+
+        while True:
+            if edge_index in visited_edges:
+                break
+            visited_edges.add(edge_index)
+            edge_indices.append(edge_index)
+            next_node = other_node(edge_index, current_node)
+            node_indices.append(next_node)
+            if degrees.get(next_node, 0) != 2:
+                break
+            next_edges = [candidate for candidate in incident_edges[next_node] if candidate != edge_index]
+            if not next_edges:
+                break
+            current_node = next_node
+            edge_index = next_edges[0]
+
+        apply_metrics(node_indices, edge_indices)
+
+    def walk_loop(first_edge: int):
+        start_node = segments[first_edge]["a"]
+        node_indices = [start_node]
+        edge_indices = []
+        current_node = start_node
+        edge_index = first_edge
+
+        while True:
+            if edge_index in visited_edges:
+                break
+            visited_edges.add(edge_index)
+            edge_indices.append(edge_index)
+            next_node = other_node(edge_index, current_node)
+            node_indices.append(next_node)
+            next_edges = [candidate for candidate in incident_edges[next_node] if candidate != edge_index]
+            if not next_edges:
+                break
+            current_node = next_node
+            edge_index = next_edges[0]
+            if edge_index == first_edge:
+                break
+
+        if len(node_indices) > 1 and node_indices[-1] != node_indices[0]:
+            node_indices.append(node_indices[0])
+        apply_metrics(node_indices, edge_indices)
+
+    anchor_nodes = [node for node, degree in degrees.items() if degree != 2]
+    for start_node in anchor_nodes:
+        for edge_index in incident_edges[start_node]:
+            if edge_index not in visited_edges:
+                walk_from_anchor(start_node, edge_index)
+
+    for edge_index in range(len(segments)):
+        if edge_index not in visited_edges:
+            walk_loop(edge_index)
+
+
+def compute_network_diagnostics(segments, point_pressure):
+    hematocrit_values = np.array([max(float(seg["hematocrit"]), 0.0) for seg in segments], dtype=float)
+    hematocrit_mean = float(np.mean(hematocrit_values)) if len(hematocrit_values) else 0.0
+    hematocrit_min = float(np.min(hematocrit_values)) if len(hematocrit_values) else 0.0
+    hematocrit_max = float(np.max(hematocrit_values)) if len(hematocrit_values) else 0.0
+    mean_tortuosity = float(np.mean([float(seg["tortuosity"]) for seg in segments])) if segments else 1.0
+
+    pressure_range = 0.0
+    if point_pressure is not None and len(point_pressure):
+        pressure_range = float(np.max(point_pressure) - np.min(point_pressure))
+    pressure_tol = pressure_range * 0.005
+
+    pressure_edges = []
+    pressure_gradients = []
+    flow_magnitudes = []
+    aligned_edges = 0
+    for seg in segments:
+        pressure_drop = seg["pressure_drop"]
+        if pressure_drop is None:
+            continue
+        flow = float(seg["flow"])
+        pressure_edges.append(seg)
+        gradient = abs(float(pressure_drop)) / max(float(seg["length_raw"]), 1e-9)
+        pressure_gradients.append(gradient)
+        flow_magnitudes.append(abs(flow))
+        if abs(float(pressure_drop)) <= pressure_tol:
+            aligned_edges += 1
+        elif (flow >= 0 and pressure_drop >= 0) or (flow < 0 and pressure_drop <= 0):
+            aligned_edges += 1
+
+    pressure_edge_count = len(pressure_edges)
+    flow_pressure_agreement = aligned_edges / pressure_edge_count if pressure_edge_count else None
+    pressure_gradient_median = float(np.median(pressure_gradients)) if pressure_gradients else None
+    pressure_gradient_p90 = float(np.percentile(pressure_gradients, 90)) if pressure_gradients else None
+
+    flow_pressure_corr = None
+    if len(flow_magnitudes) >= 2:
+        flow_std = float(np.std(flow_magnitudes))
+        grad_std = float(np.std(pressure_gradients))
+        if flow_std > 1e-12 and grad_std > 1e-12:
+            flow_pressure_corr = float(np.corrcoef(flow_magnitudes, pressure_gradients)[0, 1])
+
+    return {
+        "hematocritMean": hematocrit_mean,
+        "hematocritMin": hematocrit_min,
+        "hematocritMax": hematocrit_max,
+        "meanTortuosity": mean_tortuosity,
+        "pressureAwareEdgeCount": pressure_edge_count,
+        "flowPressureAgreement": flow_pressure_agreement,
+        "pressureGradientMedian": pressure_gradient_median,
+        "pressureGradientP90": pressure_gradient_p90,
+        "flowPressureCorrelation": flow_pressure_corr,
+    }
 
 
 def connected_components(adjacency):
@@ -296,6 +460,11 @@ def build_exterior_camera_path(points_norm: np.ndarray, guide_path: np.ndarray, 
             lift = world_up.copy()
 
         progress = index / max(sample_count - 1, 1)
+
+        descent_curve = np.sin(progress * np.pi) ** 2.5
+        height_factor = 1.0 - descent_curve * 0.75
+        altitude_boost = world_up * (min_clearance * 2.8 * height_factor)
+
         weave = np.sin(progress * np.pi * 3.2 + 0.45)
         lean = np.cos(progress * np.pi * 2.1 - 0.3)
         outward = normalize_vector(
@@ -308,21 +477,25 @@ def build_exterior_camera_path(points_norm: np.ndarray, guide_path: np.ndarray, 
 
         core_pull = np.sin(progress * np.pi) ** 1.35
         offset = min_clearance * (1.82 - 0.96 * core_pull + 0.08 * np.sin(progress * np.pi * 2.0))
-        candidate = base + outward * offset
+        
+        initial_offset = min_clearance * 3.5 * (1.0 - descent_curve)
+        total_offset = offset + initial_offset
+        
+        candidate = base + outward * total_offset + altitude_boost
         nearest = float(np.min(np.linalg.norm(points_norm - candidate, axis=1)))
 
         attempt = 0
         while nearest < min_clearance and attempt < 8:
             attempt += 1
-            offset += min_clearance * 0.34
+            total_offset += min_clearance * 0.34
             lateral = side * ((-1.0) ** attempt) * min_clearance * (0.18 + attempt * 0.04)
-            candidate = base + outward * offset + lateral
+            candidate = base + outward * total_offset + altitude_boost + lateral
             nearest = float(np.min(np.linalg.norm(points_norm - candidate, axis=1)))
 
         camera_points.append(candidate)
 
     camera_points = np.vstack(camera_points)
-    smoothed = smooth_polyline(camera_points, passes=4)
+    smoothed = smooth_polyline(camera_points, passes=5)
 
     for index, base in enumerate(guide_path):
         candidate = smoothed[index]
@@ -464,9 +637,12 @@ def colorized_data(points_norm, segments, robust_max, scale):
                 round(float(seg["hematocrit"]), 6),
                 round(float(seg["diam_um"]), 6),
                 round(float(seg["shear_stress"]), 6),
-                round(float(seg["pressure_a"]), 6),
-                round(float(seg["pressure_b"]), 6),
-                round(float(seg["pressure_drop"]), 6),
+                None if seg["pressure_a"] is None else round(float(seg["pressure_a"]), 6),
+                None if seg["pressure_b"] is None else round(float(seg["pressure_b"]), 6),
+                None if seg["pressure_drop"] is None else round(float(seg["pressure_drop"]), 6),
+                round(float(seg["path_length_raw"]), 6),
+                round(float(seg["straight_length_raw"]), 6),
+                round(float(seg["tortuosity"]), 6),
             ]
         )
 
@@ -500,25 +676,30 @@ def build_render_strands(points_norm: np.ndarray, segments, robust_max: float, s
         strand_points = []
         strand_radii = []
         strand_speeds = []
+        strand_flows = []
         for idx, node in enumerate(node_indices):
             left_edge = edge_indices[idx - 1] if idx > 0 else edge_indices[0]
             right_edge = edge_indices[idx] if idx < len(edge_indices) else edge_indices[-1]
             related = [left_edge] if left_edge == right_edge else [left_edge, right_edge]
             radius_norm = float(np.mean([segments[edge]["radius_um"] / scale for edge in related]))
             speed_norm = float(np.mean([min(segments[edge]["speed"] / robust_max, 1.0) for edge in related]))
+            flow_value = float(np.mean([segments[edge]["flow"] for edge in related]))
             strand_points.append([round(float(v), 6) for v in points_norm[node]])
             strand_radii.append(round(radius_norm, 6))
             strand_speeds.append(round(speed_norm, 6))
+            strand_flows.append(round(flow_value, 6))
 
-        return {
+        result = {
             "points": strand_points,
             "radii": strand_radii,
             "speeds": strand_speeds,
+            "flows": strand_flows,
             "startNode": int(node_indices[0]),
             "endNode": int(node_indices[-1]),
             "degreeStart": int(degrees.get(node_indices[0], 1)),
             "degreeEnd": int(degrees.get(node_indices[-1], 1)),
         }
+        return result
 
     def walk_from_anchor(start_node: int, first_edge: int):
         node_indices = [start_node]
@@ -584,6 +765,137 @@ def build_render_strands(points_norm: np.ndarray, segments, robust_max: float, s
             strands.append(strand)
 
     return strands
+
+
+def build_viewer_data(input_vtk: Path):
+    points_raw, cells, point_scalars, cell_scalars = read_legacy_vtk_polydata(input_vtk)
+
+    velocity = cell_scalars.get("velocity_mm_s")
+    if velocity is None:
+        raise RuntimeError("velocity_mm_s not found in CELL_DATA.")
+    flow_nl_min = cell_scalars.get("flow_nl_min")
+    hematocrit = cell_scalars.get("hematocrit")
+    shear_stress = cell_scalars.get("shear_stress")
+    point_pressure = point_scalars.get("pressure")
+
+    radius_um = cell_scalars.get("radius_um")
+    diam_um = cell_scalars.get("diam_um")
+    if radius_um is None:
+        if diam_um is not None:
+            radius_um = diam_um / 2.0
+        else:
+            radius_um = np.full(len(cells), 4.0, dtype=float)
+    if diam_um is None:
+        diam_um = radius_um * 2.0
+
+    points_norm, center, scale = normalize_points(points_raw)
+    segments = build_segments(
+        cells,
+        points_raw,
+        velocity,
+        radius_um,
+        flow_nl_min=flow_nl_min,
+        hematocrit=hematocrit,
+        diam_um=diam_um,
+        shear_stress=shear_stress,
+        point_pressure=point_pressure,
+    )
+    assign_strand_metrics(points_raw, segments)
+    adjacency = build_adjacency(segments)
+
+    speed = np.abs(velocity)
+    robust_max = float(np.percentile(speed, 98))
+    if robust_max <= 0:
+        robust_max = float(np.max(speed))
+    if robust_max <= 0:
+        robust_max = 1.0
+    flow_values = np.array([float(seg["flow"]) for seg in segments], dtype=float)
+    flow_abs = np.abs(flow_values)
+    robust_flow_abs_max = float(np.percentile(flow_abs, 98)) if len(flow_abs) else 1.0
+    if robust_flow_abs_max <= 0:
+        robust_flow_abs_max = float(np.max(flow_abs)) if len(flow_abs) else 1.0
+    if robust_flow_abs_max <= 0:
+        robust_flow_abs_max = 1.0
+
+    scene_data = colorized_data(points_norm, segments, robust_max, scale)
+    render_strands = build_render_strands(points_norm, segments, robust_max, scale)
+    tour = choose_tour(points_raw, points_norm, adjacency, segments, scale)
+    network_diagnostics = compute_network_diagnostics(segments, point_pressure)
+
+    median_edge_length_norm = scene_data["median_edge_length_norm"]
+    radius_boost = 1.85 if scene_data["median_radius_norm"] <= 0 else max(1.4, min(2.3, median_edge_length_norm / scene_data["median_radius_norm"] * 0.55))
+    tour_duration = float(np.clip(tour["path_length_raw"] / 185.0, 30.0, 44.0))
+
+    viewer_data = {
+        "points": scene_data["points"],
+        "edges": scene_data["edges"],
+        "pointPressure": None if point_pressure is None else [round(float(v), 6) for v in point_pressure],
+        "vesselStrands": render_strands,
+        "cameraPath": [[round(float(v), 6) for v in row] for row in tour["camera_path_norm"]],
+        "focusPath": [[round(float(v), 6) for v in row] for row in tour["focus_path_norm"]],
+        "branchPoints": [[round(float(v), 6) for v in row] for row in tour["branch_points"]],
+        "branchNodes": [int(v) for v in tour["branch_nodes"]],
+        "branchStrengths": [round(float(v), 6) for v in tour["branch_strengths"]],
+        "hubPoint": [round(float(v), 6) for v in tour["hub_point"]],
+        "stats": {
+            "pointCount": int(len(points_raw)),
+            "cellCount": int(len(cells)),
+            "segmentCount": int(len(segments)),
+            "branchCount": int(tour["branch_count"]),
+            "endpointCount": int(tour["endpoint_count"]),
+            "velocityMin": float(np.min(velocity)),
+            "velocityMax": float(np.max(velocity)),
+            "robustMax": robust_max,
+            "flowMin": float(np.min(flow_values)) if len(flow_values) else 0.0,
+            "flowMax": float(np.max(flow_values)) if len(flow_values) else 0.0,
+            "flowRobustAbsMax": robust_flow_abs_max,
+            "pressureMin": None if point_pressure is None else float(np.min(point_pressure)),
+            "pressureMax": None if point_pressure is None else float(np.max(point_pressure)),
+            "tourLengthRaw": float(tour["path_length_raw"]),
+            "scale": scale,
+        },
+        "visual": {
+            "radiusBoost": round(float(radius_boost), 6),
+            "minDisplayRadius": round(float(scene_data["min_display_radius"]), 6),
+            "tourDurationSeconds": round(tour_duration, 3),
+            "cameraClearance": round(float(tour["camera_clearance"]), 6),
+        },
+        "particles": {
+            "sceneSpeedScale": round(float(1000.0 / scale * 0.17), 6),
+            "size": round(float(scene_data["min_display_radius"] * 2.1), 6),
+        },
+        "network": network_diagnostics,
+        "fields": {
+            "pointScalars": sorted(point_scalars.keys()),
+            "cellScalars": sorted(cell_scalars.keys()),
+        },
+    }
+
+    summary = [
+        f"Points: {len(points_raw)} | Cells: {len(cells)} | Segments: {len(segments)}",
+        f"Renderable strands: {len(render_strands)}",
+        f"Branch points: {tour['branch_count']} | Endpoints: {tour['endpoint_count']}",
+        f"Velocity range: {float(np.min(velocity)):.4g} to {float(np.max(velocity)):.4g} mm/s",
+        f"Flow range: {float(np.min(flow_values)):.4g} to {float(np.max(flow_values)):.4g} nL/min",
+        f"Robust |velocity| max (98th percentile): {robust_max:.4g} mm/s",
+        f"Camera path length: {tour['path_length_raw']:.1f} raw units",
+        f"Mean hematocrit: {network_diagnostics['hematocritMean']:.4f} | Mean tortuosity: {network_diagnostics['meanTortuosity']:.4f}",
+        "Flow-pressure agreement: "
+        + (
+            "N/A"
+            if network_diagnostics["flowPressureAgreement"] is None
+            else f"{network_diagnostics['flowPressureAgreement'] * 100:.1f}%"
+        ),
+        f"Point fields: {', '.join(sorted(point_scalars.keys())) or 'none'}",
+        f"Cell fields: {', '.join(sorted(cell_scalars.keys())) or 'none'}",
+    ]
+
+    return viewer_data, summary
+
+
+def render_viewer_html(viewer_data: dict, *, asset_script_src: str = "./vendor/three.global.js"):
+    html = HTML_TEMPLATE.replace("__VIEWER_DATA__", json.dumps(viewer_data, separators=(",", ":")))
+    return html.replace('./vendor/three.global.js', asset_script_src)
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -747,6 +1059,77 @@ button.active {
 
 .phase-row {
   margin-top: 10px;
+}
+
+.mode-row {
+  margin-top: 10px;
+}
+
+.mode-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.slice-row,
+.probe-row {
+  margin-top: 10px;
+}
+
+.slice-axis-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.slice-axis-btn {
+  padding: 7px 6px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.mode-btn {
+  padding: 7px 6px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.network-report {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.network-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.network-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.network-row:last-child {
+  border-bottom: none;
+}
+
+.network-label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(245, 239, 231, 0.52);
+}
+
+.network-value {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: "IBM Plex Mono", monospace;
+  text-align: right;
 }
 
 .phase-grid {
@@ -983,6 +1366,86 @@ input[type="range"] {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+.recording-overlay {
+  position: fixed;
+  left: 16px;
+  top: 18px;
+  display: none;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  backdrop-filter: blur(18px);
+  background: linear-gradient(180deg, rgba(220, 38, 38, 0.15), rgba(185, 28, 28, 0.35));
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  box-shadow: 0 0 20px rgba(239, 68, 68, 0.2);
+  z-index: 15;
+}
+
+.recording-overlay.visible {
+  display: flex;
+}
+
+.recording-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.recording-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ef4444;
+  animation: recording-pulse 1s ease-in-out infinite;
+}
+
+@keyframes recording-pulse {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+  }
+  50% {
+    opacity: 0.7;
+    box-shadow: 0 0 0 6px rgba(239, 68, 68, 0);
+  }
+}
+
+.recording-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #ef4444;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.recording-time {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: "IBM Plex Mono", monospace;
+  color: #fca5a5;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.15);
+}
+
+.stop-record-btn {
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: rgba(239, 68, 68, 0.85);
+  border: 1px solid rgba(254, 202, 202, 0.5);
+  color: white;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 120ms ease, background 120ms ease;
+}
+
+.stop-record-btn:hover {
+  transform: translateY(-1px);
+  background: rgba(220, 38, 38, 0.95);
+}
 </style>
 </head>
 <body>
@@ -1013,6 +1476,8 @@ input[type="range"] {
   <div class="button-row">
       <button id="playPauseBtn" class="active">Pause</button>
       <button id="restartBtn">Restart</button>
+      <button id="startRecordBtn">Start Record</button>
+      <button id="axesBtn" class="active">Axes</button>
   </div>
 
   <div class="phase-row">
@@ -1023,9 +1488,29 @@ input[type="range"] {
     <div class="phase-grid">
       <button class="phase-btn" data-phase-key="top-overview" data-phase-progress="0.07">Overview</button>
       <button class="phase-btn" data-phase-key="perimeter-orbit" data-phase-progress="0.22">Perimeter</button>
-      <button class="phase-btn" data-phase-key="core-approach" data-phase-progress="0.37">Approach</button>
-      <button class="phase-btn" data-phase-key="interior-grove" data-phase-progress="0.66">Interior</button>
+      
+      
+      <button class="phase-btn" data-phase-key="interior-grove" data-phase-progress="0.72">Walk-In</button>
       <button class="phase-btn" data-phase-key="exit-reveal" data-phase-progress="0.94">Exit</button>
+    </div>
+  </div>
+
+  <div class="mode-row">
+    <div class="speed-head">
+      <span>View Mode</span>
+      <span id="modeReadout">Combined</span>
+    </div>
+    <div class="mode-grid">
+      <button class="mode-btn active" data-mode="combined">Combined</button>
+      <button class="mode-btn" data-mode="velocity">Velocity</button>
+      <button class="mode-btn" data-mode="local">Probe</button>
+    </div>
+  </div>
+
+  <div class="probe-row">
+    <div class="speed-head">
+      <span>Probe</span>
+      <span id="probeReadout">Click vessel</span>
     </div>
   </div>
 
@@ -1034,8 +1519,49 @@ input[type="range"] {
       <span>Playback speed</span>
       <span id="speedReadout">1.0x</span>
     </div>
-    <input id="speedSlider" type="range" min="0.5" max="1.8" step="0.1" value="1.0">
+    <input id="speedSlider" type="range" min="0.2" max="1.2" step="0.05" value="0.45">
   </div>
+
+  <div class="density-row">
+    <div class="speed-head">
+      <span>Cell density</span>
+      <span id="densityReadout">100%</span>
+    </div>
+    <input id="densitySlider" type="range" min="20" max="200" step="5" value="100">
+  </div>
+
+  <div class="particle-row">
+    <div class="speed-head">
+      <span>Particle count</span>
+      <span id="particleCountReadout">Auto</span>
+    </div>
+    <input id="particleCountSlider" type="range" min="100" max="50000" step="100" value="0">
+  </div>
+
+  <div class="volume-row">
+    <div class="speed-head">
+      <span>Cell volume by Hct</span>
+      <span id="volumeReadout">On</span>
+    </div>
+    <input id="volumeSlider" type="range" min="0" max="100" step="5" value="100">
+  </div>
+
+  <div class="network-report">
+    <div class="speed-head">
+      <span>Network</span>
+      <span>Flow vs Pressure</span>
+    </div>
+    <div class="network-grid" id="networkSummary"></div>
+  </div>
+</section>
+
+<section class="recording-overlay" id="recordingOverlay">
+  <div class="recording-indicator">
+    <div class="recording-dot"></div>
+    <span class="recording-label">Recording</span>
+    <span class="recording-time" id="recordingTime">00:00</span>
+  </div>
+  <button id="stopRecordBtn" class="stop-record-btn">Stop Record</button>
 </section>
 
 <script id="viewer-data" type="application/json">__VIEWER_DATA__</script>
@@ -1063,25 +1589,59 @@ const focusPoints = data.focusPath.map((row) => new THREE.Vector3(row[0], row[1]
 const stage = document.getElementById("stage");
 const playPauseBtn = document.getElementById("playPauseBtn");
 const restartBtn = document.getElementById("restartBtn");
+const axesBtn = document.getElementById("axesBtn");
 const phaseButtons = Array.from(document.querySelectorAll(".phase-btn"));
 const speedSlider = document.getElementById("speedSlider");
 const speedReadout = document.getElementById("speedReadout");
+const densitySlider = document.getElementById("densitySlider");
+const densityReadout = document.getElementById("densityReadout");
+const particleCountSlider = document.getElementById("particleCountSlider");
+const particleCountReadout = document.getElementById("particleCountReadout");
+const volumeSlider = document.getElementById("volumeSlider");
+const volumeReadout = document.getElementById("volumeReadout");
+const networkSummary = document.getElementById("networkSummary");
+const sliceSlider = document.getElementById("sliceSlider");
+const sliceReadout = document.getElementById("sliceReadout");
+const sliceAxisButtons = Array.from(document.querySelectorAll(".slice-axis-btn"));
+const probeReadout = document.getElementById("probeReadout");
+const startRecordBtn = document.getElementById("startRecordBtn");
+const stopRecordBtn = document.getElementById("stopRecordBtn");
+const recordingOverlay = document.getElementById("recordingOverlay");
+const recordingTime = document.getElementById("recordingTime");
+
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordingStartTime = 0;
+let recordingInterval = null;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight);
+const defaultPixelRatio = Math.min(window.devicePixelRatio, 2);
+let exportSurfaceActive = false;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.28;
 renderer.domElement.style.cursor = "grab";
 stage.appendChild(renderer.domElement);
 
+function setRenderSurface(width, height, pixelRatio = defaultPixelRatio, updateStyle = true) {
+  renderer.setPixelRatio(pixelRatio);
+  renderer.setSize(width, height, updateStyle);
+  camera.aspect = width / Math.max(height, 1);
+  camera.updateProjectionMatrix();
+}
+
 const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(0x06080d, 0.19);
 
-const camera = new THREE.PerspectiveCamera(54, window.innerWidth / window.innerHeight, 0.001, 100);
+const camera = new THREE.PerspectiveCamera(54, window.innerWidth / window.innerHeight, 0.0001, 100);
 camera.position.set(2.0, 0.72, 1.58);
 scene.add(camera);
+setRenderSurface(window.innerWidth, window.innerHeight, defaultPixelRatio);
+
+const axesHelper = new THREE.AxesHelper(0.6);
+axesHelper.position.set(-0.85, -0.85, -0.85);
+axesHelper.visible = true;
+scene.add(axesHelper);
 
 const ambient = new THREE.AmbientLight(0xfff0e0, 0.42);
 scene.add(ambient);
@@ -1106,11 +1666,11 @@ const balancedTint = new THREE.Color("#7bd1ff");
 const sourceTint = new THREE.Color("#ffc76d");
 const alertTint = new THREE.Color("#ff5b6e");
 const flowPaletteStops = [
-  { t: 0.0, color: new THREE.Color("#4a0d08") },
-  { t: 0.22, color: new THREE.Color("#74140c") },
-  { t: 0.5, color: new THREE.Color("#a61f12") },
-  { t: 0.78, color: new THREE.Color("#dd4523") },
-  { t: 1.0, color: new THREE.Color("#ffd0b7") },
+  { t: 0.0, color: new THREE.Color("#0f3cbd") },
+  { t: 0.25, color: new THREE.Color("#2d7dff") },
+  { t: 0.5, color: new THREE.Color("#dff3ff") },
+  { t: 0.75, color: new THREE.Color("#ff9a6a") },
+  { t: 1.0, color: new THREE.Color("#a31224") },
 ];
 
 function clamp(value, min, max) {
@@ -1134,33 +1694,48 @@ function samplePalette(t) {
   return flowPaletteStops[flowPaletteStops.length - 1].color.clone();
 }
 
+function sampleSpeedPalette(speedNorm) {
+  const normalized = clamp(speedNorm, 0, 1);
+  const baseColor = samplePalette(normalized);
+  const emphasis = clamp(speedNorm, 0, 1);
+  return baseColor.lerp(new THREE.Color("#ffffff"), (1.0 - emphasis) * 0.12);
+}
+
+function sampleCombinedPalette(speedNorm) {
+  return sampleSpeedPalette(speedNorm);
+}
+
 function vecFromPointIndex(index) {
   return points[index];
 }
 
+const sceneScale = data.stats?.scale || 1;
+
 const vesselMaterial = new THREE.MeshPhysicalMaterial({
-  color: vesselWallTint,
+  color: 0xffffff,
   roughness: 0.2,
   metalness: 0.0,
   clearcoat: 0.28,
   transparent: true,
-  opacity: 0.24,
-  transmission: 0.34,
+  opacity: 0.9,
+  transmission: 0.1,
   thickness: 0.12,
   ior: 1.08,
   attenuationDistance: 0.72,
   attenuationColor: new THREE.Color("#8fb5da"),
   side: THREE.DoubleSide,
   depthWrite: false,
+  vertexColors: true,
 });
+
 const edgeRecords = [];
 const pointEdges = Array.from({ length: points.length }, () => []);
-const sceneScale = data.stats?.scale || 1;
 const velocityAbsMax = Math.max(
   Math.abs(data.stats?.velocityMin ?? 0),
   Math.abs(data.stats?.velocityMax ?? 0),
   1e-6,
 );
+const networkHematocritBaseline = Math.max(data.network?.hematocritMean ?? 0, 0.42);
 const pressureRange = Math.max(
   Math.abs((data.stats?.pressureMax ?? 0) - (data.stats?.pressureMin ?? 0)),
   1e-6,
@@ -1178,6 +1753,9 @@ data.edges.forEach((edge, index) => {
   const pressureStart = edge[10] ?? null;
   const pressureEnd = edge[11] ?? null;
   const pressureDrop = edge[12] ?? (pressureStart != null && pressureEnd != null ? pressureStart - pressureEnd : 0);
+  const pathLengthRaw = edge[13] ?? edge[5] * sceneScale;
+  const straightLengthRaw = edge[14] ?? pathLengthRaw;
+  const tortuosity = edge[15] ?? 1;
   const radiusUm = diamUm * 0.5;
   const directionForward = flow < 0 ? false : velocity >= 0 || flow >= 0;
   const pressureConflict = pressureStart != null
@@ -1206,6 +1784,9 @@ data.edges.forEach((edge, index) => {
     pressureDrop,
     pressureConflict,
     length,
+    pathLengthRaw,
+    straightLengthRaw,
+    tortuosity,
     preferredStart: directionForward ? edge[0] : edge[1],
     preferredEnd: directionForward ? edge[1] : edge[0],
   };
@@ -1343,6 +1924,8 @@ function buildSmoothVesselGeometry(strand) {
   const vertexCount = sampleCount * radialSegments;
   const positions = new Float32Array(vertexCount * 3);
   const normalsArray = new Float32Array(vertexCount * 3);
+  const colorVelocityArray = new Float32Array(vertexCount * 3);
+  const colorCombinedArray = new Float32Array(vertexCount * 3);
   const indexCount = (sampleCount - 1) * radialSegments * 6;
   const indexArray = vertexCount > 65535 ? new Uint32Array(indexCount) : new Uint16Array(indexCount);
 
@@ -1351,6 +1934,10 @@ function buildSmoothVesselGeometry(strand) {
     const normal = normals[ring];
     const binormal = binormals[ring];
     const radius = sampleRadii[ring];
+    const distanceAlong = totalLength * (ring / Math.max(sampleCount - 1, 1));
+    const speedNorm = sampleScalarAlongPath(strand.speeds, cumulativeLengths, distanceAlong);
+    const velocityColor = sampleSpeedPalette(speedNorm);
+    const combinedColor = sampleCombinedPalette(speedNorm);
 
     for (let side = 0; side < radialSegments; side += 1) {
       const angle = (side / radialSegments) * Math.PI * 2;
@@ -1370,6 +1957,12 @@ function buildSmoothVesselGeometry(strand) {
       normalsArray[offset + 0] = radial.x;
       normalsArray[offset + 1] = radial.y;
       normalsArray[offset + 2] = radial.z;
+      colorVelocityArray[offset + 0] = velocityColor.r;
+      colorVelocityArray[offset + 1] = velocityColor.g;
+      colorVelocityArray[offset + 2] = velocityColor.b;
+      colorCombinedArray[offset + 0] = combinedColor.r;
+      colorCombinedArray[offset + 1] = combinedColor.g;
+      colorCombinedArray[offset + 2] = combinedColor.b;
     }
   }
 
@@ -1394,6 +1987,9 @@ function buildSmoothVesselGeometry(strand) {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute("normal", new THREE.BufferAttribute(normalsArray, 3));
+  geometry.setAttribute("colorVelocity", new THREE.BufferAttribute(colorVelocityArray, 3));
+  geometry.setAttribute("colorCombined", new THREE.BufferAttribute(colorCombinedArray, 3));
+  geometry.setAttribute("color", geometry.getAttribute("colorCombined"));
   geometry.setIndex(new THREE.BufferAttribute(indexArray, 1));
   geometry.computeBoundingSphere();
   return geometry;
@@ -1410,6 +2006,7 @@ vesselStrands.forEach((strand) => {
   strandMesh.frustumCulled = false;
   vesselGroup.add(strandMesh);
 });
+vesselGroup.renderOrder = 2;
 scene.add(vesselGroup);
 
 const jointCandidates = [];
@@ -1483,25 +2080,37 @@ if (jointCandidates.length) {
 }
 
 const linePositions = [];
-const lineColors = [];
+const lineColorsVelocity = [];
+const lineColorsCombined = [];
 edgeRecords.forEach((edge) => {
   const start = vecFromPointIndex(edge.a);
   const end = vecFromPointIndex(edge.b);
-  const edgeColor = samplePalette(edge.speedNorm).lerp(new THREE.Color("#ffe0d1"), edge.speedNorm * 0.12);
+  const velocityColor = sampleSpeedPalette(edge.speedNorm);
+  const combinedColor = sampleCombinedPalette(edge.speedNorm);
   linePositions.push(start.x, start.y, start.z, end.x, end.y, end.z);
-  lineColors.push(
-    edgeColor.r,
-    edgeColor.g,
-    edgeColor.b,
-    edgeColor.r,
-    edgeColor.g,
-    edgeColor.b,
+  lineColorsVelocity.push(
+    velocityColor.r,
+    velocityColor.g,
+    velocityColor.b,
+    velocityColor.r,
+    velocityColor.g,
+    velocityColor.b,
+  );
+  lineColorsCombined.push(
+    combinedColor.r,
+    combinedColor.g,
+    combinedColor.b,
+    combinedColor.r,
+    combinedColor.g,
+    combinedColor.b,
   );
 });
 
 const coreLineGeometry = new THREE.BufferGeometry();
 coreLineGeometry.setAttribute("position", new THREE.Float32BufferAttribute(linePositions, 3));
-coreLineGeometry.setAttribute("color", new THREE.Float32BufferAttribute(lineColors, 3));
+coreLineGeometry.setAttribute("colorVelocity", new THREE.Float32BufferAttribute(lineColorsVelocity, 3));
+coreLineGeometry.setAttribute("colorCombined", new THREE.Float32BufferAttribute(lineColorsCombined, 3));
+coreLineGeometry.setAttribute("color", coreLineGeometry.getAttribute("colorCombined"));
 const coreLineMaterial = new THREE.LineBasicMaterial({
   vertexColors: true,
   transparent: true,
@@ -1509,9 +2118,32 @@ const coreLineMaterial = new THREE.LineBasicMaterial({
 });
 const coreLines = new THREE.LineSegments(coreLineGeometry, coreLineMaterial);
 coreLines.frustumCulled = false;
-coreLines.renderOrder = 0;
+coreLines.renderOrder = 3;
 coreLines.visible = false;
 scene.add(coreLines);
+
+function applyGeometryColorMode(geometry, mode) {
+  if (!geometry) {
+    return;
+  }
+  let attributeName = "colorCombined";
+  if (mode === "velocity") {
+    attributeName = "colorVelocity";
+  } else if (mode === "local") {
+    attributeName = "colorCombined";
+  }
+  const attribute = geometry.getAttribute(attributeName) || geometry.getAttribute("colorCombined") || geometry.getAttribute("colorVelocity");
+  if (!attribute) {
+    return;
+  }
+  geometry.setAttribute("color", attribute);
+  geometry.attributes.color.needsUpdate = true;
+}
+
+function applyViewColorMode(mode) {
+  vesselGroup.children.forEach((mesh) => applyGeometryColorMode(mesh.geometry, mode));
+  applyGeometryColorMode(coreLineGeometry, "velocity");
+}
 
 const pathGeometry = new THREE.BufferGeometry().setFromPoints(cameraPoints);
 const pathMaterial = new THREE.LineBasicMaterial({
@@ -1529,12 +2161,16 @@ function edgeFlux(edge) {
   return Math.max(Math.abs(edge.flow), 1e-4);
 }
 
+function edgeDischargeHematocrit(edge) {
+  return Math.max(edge.hematocrit > 1e-4 ? edge.hematocrit : networkHematocritBaseline, 1e-4);
+}
+
 function edgeTargetWeight(edge) {
   const crossSectionProxy = Math.PI * Math.pow(Math.max(edge.radiusUm, 1e-4), 2);
-  const volumeProxy = Math.max(edge.length, 1e-4) * crossSectionProxy;
-  const hematocritWeight = 0.08 + Math.max(edge.hematocrit, 0) * 1.92;
-  const flowSupport = 0.35 + edge.velocityNorm * 0.65;
-  return Math.max(0.02, volumeProxy * hematocritWeight * flowSupport);
+  const volumeProxy = Math.max(edge.pathLengthRaw, 1e-4) * crossSectionProxy;
+  const hematocritWeight = Math.pow(Math.max(edge.hematocrit, 0.01), 0.5);
+  const tortuosityWeight = clamp(edge.tortuosity, 1.0, 3.0);
+  return Math.max(0.02, volumeProxy * hematocritWeight * (0.92 + (tortuosityWeight - 1.0) * 0.4));
 }
 
 function edgeFlowMatchesPressure(edge) {
@@ -1668,49 +2304,7 @@ const spawnProfiles = nodeFlowProfiles.filter(
   (profile) => profile && profile.outgoingEdges.length && (profile.type === "source" || profile.outgoingFlux >= profile.incomingFlux * 0.9),
 );
 
-const branchGeometry = new THREE.IcosahedronGeometry(1, 1);
-const branchMaterial = new THREE.MeshBasicMaterial({
-  transparent: true,
-  opacity: 0.22,
-  depthWrite: false,
-});
-const branchMesh = new THREE.InstancedMesh(branchGeometry, branchMaterial, branchPoints.length);
-branchMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-branchMesh.frustumCulled = false;
-branchMesh.renderOrder = 6;
-const branchDummy = new THREE.Object3D();
 
-function updateBranchMarkers(focusPoint) {
-  branchPoints.forEach((point, index) => {
-    const strength = branchStrengths[index] || 0;
-    const profile = nodeFlowProfiles[branchNodes[index]];
-    const anomaly = profile ? profile.anomaly : 0;
-    const continuity = profile ? profile.connectivityScore : 0;
-    const distance = point.distanceTo(focusPoint);
-    const glow = clamp(1.0 - distance / 0.22, 0, 1);
-    const scale = data.visual.minDisplayRadius * (0.36 + strength * 0.28 + glow * 0.46 + anomaly * 0.52 + (1 - continuity) * 0.16);
-    branchDummy.position.copy(point);
-    branchDummy.scale.setScalar(scale);
-    branchDummy.updateMatrix();
-    branchMesh.setMatrixAt(index, branchDummy.matrix);
-
-    const neutralColor = samplePalette(profile ? profile.speedNorm : strength).lerp(
-      sourceTint,
-      profile && profile.type === "source" ? 0.36 : 0.0,
-    );
-    const color = neutralColor
-      .lerp(balancedTint, continuity * 0.22)
-      .lerp(alertTint, anomaly);
-    branchMesh.setColorAt(index, color);
-  });
-  branchMesh.instanceMatrix.needsUpdate = true;
-  if (branchMesh.instanceColor) {
-    branchMesh.instanceColor.needsUpdate = true;
-  }
-}
-
-updateBranchMarkers(hubPoint);
-scene.add(branchMesh);
 
 const hubHalo = new THREE.Mesh(
   new THREE.SphereGeometry(data.visual.minDisplayRadius * 2.4, 18, 18),
@@ -1763,31 +2357,29 @@ const worldUp = new THREE.Vector3(0, 1, 0);
 const center = new THREE.Vector3(0, 0, 0);
 const focusMid = focusCurve.getPointAt(0.5);
 
-function getFrame(u) {
+const modelOrigin = new THREE.Vector3(0, 0, 0);
+
+function getCurveFrame(curve, u, lead = 0.03) {
   const clamped = clamp(u, 0, 1);
-  const position = cameraCurve.getPointAt(clamped);
-  const tangent = cameraCurve.getTangentAt(clamped).normalize();
-  const focus = focusCurve.getPointAt(clamped);
-  const focusLead = focusCurve.getPointAt(clamp(clamped + 0.03, 0, 0.999));
+  const position = curve.getPointAt(clamped);
+  const tangent = curve.getTangentAt(clamped).normalize();
+  const focusLead = curve.getPointAt(clamp(clamped + lead, 0, 0.999));
 
-  let normal = focus.clone().sub(position);
-  if (normal.lengthSq() < 1e-6) {
-    normal.copy(worldUp);
-  } else {
-    normal.normalize();
-  }
-
-  let side = new THREE.Vector3().crossVectors(tangent, normal);
-  if (side.lengthSq() < 1e-6) {
-    side = new THREE.Vector3().crossVectors(worldUp, tangent);
-  }
+  let side = new THREE.Vector3().crossVectors(tangent, worldUp);
   if (side.lengthSq() < 1e-6) {
     side = new THREE.Vector3(1, 0, 0).cross(tangent);
   }
   side.normalize();
-  normal = new THREE.Vector3().crossVectors(side, tangent).normalize();
+  const normal = new THREE.Vector3().crossVectors(side, tangent).normalize();
 
-  return { position, tangent, side, normal, focus, focusLead };
+  return { position, tangent, side, normal, focusLead };
+}
+
+function getFrame(u) {
+  const cameraFrame = getCurveFrame(cameraCurve, u, 0.03);
+  const focus = focusCurve.getPointAt(clamp(u, 0, 1));
+  const focusLead = focusCurve.getPointAt(clamp(u + 0.03, 0, 0.999));
+  return { ...cameraFrame, focus, focusLead };
 }
 
 let hubFocusIndex = 0;
@@ -1811,16 +2403,17 @@ if (interiorEndU - interiorStartU < 0.42) {
 
 function topDownSurveyState(localT) {
   const eased = easeInOutCubic(localT);
-  const angle = -0.24 + eased * Math.PI * 1.06;
-  const radiusX = 0.56;
-  const radiusZ = 0.44;
+  const startAngle = -Math.PI / 2;
+  const angle = startAngle + eased * Math.PI * 2;
+  const radius = 1.8;
+  const height = 1.2;
   return {
     position: new THREE.Vector3(
-      Math.cos(angle) * radiusX,
-      1.62 + Math.sin(localT * Math.PI) * 0.1,
-      Math.sin(angle) * radiusZ,
+      Math.cos(angle) * radius,
+      height,
+      Math.sin(angle) * radius,
     ),
-    lookAt: center.clone().lerp(hubPoint, 0.12),
+    lookAt: new THREE.Vector3(0, 0, 0),
     up: worldUp.clone(),
     phase: "Top overview",
     copy: "A bird's-eye pass restores the full model silhouette first, so the audience can register the vascular canopy before we descend into it.",
@@ -1853,15 +2446,22 @@ function outerSurveyState(localT) {
   };
 }
 
-const interiorEntryFrame = getFrame(interiorStartU);
-const interiorEntryPosition = interiorEntryFrame.position
+const walkEntryFrame = getCurveFrame(focusCurve, interiorStartU, 0.02);
+const walkStartFrame = getCurveFrame(focusCurve, interiorStartU, 0.035);
+const walkEndFrame = getCurveFrame(focusCurve, interiorEndU, 0.035);
+const interiorEntryPosition = walkEntryFrame.position
   .clone()
-  .add(interiorEntryFrame.tangent.clone().multiplyScalar(-0.08))
-  .add(interiorEntryFrame.normal.clone().multiplyScalar(0.04))
-  .add(interiorEntryFrame.side.clone().multiplyScalar(-0.03));
-const interiorEntryLookAt = interiorEntryFrame.focusLead.clone();
+  .add(walkEntryFrame.normal.clone().multiplyScalar(0.046))
+  .add(walkEntryFrame.side.clone().multiplyScalar(-0.012))
+  .add(walkEntryFrame.tangent.clone().multiplyScalar(-0.034));
+const interiorEntryLookAt = walkStartFrame.position
+  .clone()
+  .lerp(walkStartFrame.focusLead, 0.92);
 
-const interiorExitFrame = getFrame(interiorEndU);
+const parachuteStart = outerSurveyState(1.0).position.clone();
+const parachuteControl = parachuteStart.clone().lerp(interiorEntryPosition, 0.5).add(new THREE.Vector3(0, 0.6, 0));
+const parachuteEnd = interiorEntryPosition.clone();
+
 const exitFrame = getFrame(0.985);
 const exitRevealPosition = exitFrame.position
   .clone()
@@ -1869,51 +2469,56 @@ const exitRevealPosition = exitFrame.position
   .add(exitFrame.normal.clone().multiplyScalar(0.14))
   .add(exitFrame.side.clone().multiplyScalar(0.06));
 const exitRevealLookAt = focusCurve.getPointAt(0.96).clone().lerp(center, 0.08);
-const interiorStandBase = center.clone().lerp(hubPoint, 0.18).add(new THREE.Vector3(0, -0.028, 0));
-const topOverviewEnd = 0.14;
-const perimeterEnd = 0.3;
-const approachEnd = 0.44;
-const interiorEnd = 0.88;
+
+const topOverviewEnd = 0.1;
+const perimeterEnd = 0.23;
+const interiorEnd = 0.985;
 const phaseDefinitions = [
   { key: "top-overview", end: topOverviewEnd },
   { key: "perimeter-orbit", end: perimeterEnd },
-  { key: "core-approach", end: approachEnd },
   { key: "interior-grove", end: interiorEnd },
   { key: "exit-reveal", end: 1.0 },
 ];
 
-function interiorAtriumState(localT) {
-  const eased = easeInOutCubic(localT);
-  const lookAngle = -0.36 + eased * Math.PI * 1.84;
-  const stanceAngle = -0.18 + eased * Math.PI * 0.9;
-  const stanceRadius = 0.012 + Math.sin(eased * Math.PI * 2.0) * 0.002;
-  const breathe = Math.sin(eased * Math.PI * 4.0) * 0.004;
-  const headLift = 0.46 + Math.sin(eased * Math.PI * 1.15) * 0.04;
+function interiorWalkState(localT) {
+  const eased = 1.0 - Math.pow(1.0 - localT, 3);
+  const walkStartPos = new THREE.Vector3(0.012, 0.184, 0.173);
+  const walkEndPos = new THREE.Vector3(0.271, 0.530, 0.003);
+  const position = new THREE.Vector3().lerpVectors(walkStartPos, walkEndPos, eased);
+  const direction = new THREE.Vector3().subVectors(walkEndPos, walkStartPos).normalize();
+  const lookAt = position.clone().add(direction.multiplyScalar(0.3));
+
   return {
-    position: interiorStandBase
-      .clone()
-      .add(new THREE.Vector3(
-        Math.cos(stanceAngle) * stanceRadius,
-        breathe,
-        Math.sin(stanceAngle) * stanceRadius,
-      )),
-    lookAt: center.clone().add(new THREE.Vector3(
-      Math.cos(lookAngle) * 0.24,
-      headLift,
-      Math.sin(lookAngle) * 0.24,
-    )),
+    position,
+    lookAt,
     up: worldUp.clone(),
-    phase: "Interior atrium",
-    copy: "The camera now stands near the network center and looks upward while slowly sweeping around, reading the vessel canopy overhead instead of traveling along a single branch.",
-    vesselOpacity: 0.17,
-    fogDensity: 0.19,
-    pathOpacity: 0.03,
-    hubOpacity: 0.06,
+    phase: "Interior walk",
+    copy: "The camera walks directly between two points inside the vessel canopy.",
+    vesselOpacity: 0.2,
+    fogDensity: 0.24,
+    pathOpacity: 0.0,
+    hubOpacity: 0.02,
+    isInterior: true,
+    targetFov: 62,
   };
 }
 
-const interiorStartPose = interiorAtriumState(0.0);
-const interiorEndPose = interiorAtriumState(1.0);
+const interiorStartPose = {
+  position: interiorEntryPosition.clone(),
+  lookAt: interiorEntryLookAt.clone(),
+  up: worldUp.clone(),
+};
+const interiorEndPose = interiorWalkState(1.0);
+
+function getPhaseKeyFromProgress(progress) {
+  const wrapped = ((progress % 1) + 1) % 1;
+  for (const phase of phaseDefinitions) {
+    if (wrapped <= phase.end) {
+      return phase.key;
+    }
+  }
+  return phaseDefinitions[phaseDefinitions.length - 1].key;
+}
 
 function getTourTargets(progress) {
   if (progress <= topOverviewEnd) {
@@ -1924,25 +2529,9 @@ function getTourTargets(progress) {
     return outerSurveyState((progress - topOverviewEnd) / (perimeterEnd - topOverviewEnd));
   }
 
-  if (progress <= approachEnd) {
-    const local = easeInOutCubic((progress - perimeterEnd) / (approachEnd - perimeterEnd));
-    const start = outerSurveyState(1.0);
-    return {
-      position: start.position.clone().lerp(interiorStartPose.position, local),
-      lookAt: start.lookAt.clone().lerp(interiorStartPose.lookAt, local),
-      up: worldUp.clone().lerp(interiorStartPose.up, local * 0.22).normalize(),
-      phase: "Core approach",
-      copy: "The descent now leaves the perimeter and settles toward the center of the vascular network, preparing for an upward-looking interior survey rather than a vessel-following flythrough.",
-      vesselOpacity: 0.21,
-      fogDensity: 0.16,
-      pathOpacity: 0.06,
-      hubOpacity: 0.09,
-    };
-  }
-
   if (progress <= interiorEnd) {
-    const local = (progress - approachEnd) / (interiorEnd - approachEnd);
-    return interiorAtriumState(local);
+    const local = (progress - perimeterEnd) / (interiorEnd - perimeterEnd);
+    return interiorWalkState(local);
   }
 
   const local = easeInOutCubic((progress - interiorEnd) / (1.0 - interiorEnd));
@@ -1951,7 +2540,7 @@ function getTourTargets(progress) {
     lookAt: interiorEndPose.lookAt.clone().lerp(exitRevealLookAt, local),
     up: interiorEndPose.up.clone().lerp(worldUp, 0.68 * local + 0.18).normalize(),
     phase: "Exit reveal",
-    copy: "The final pullback returns to an outside read on the whole structure after the centered upward-looking survey within the network core.",
+    copy: "After the walk-through, the camera finally pulls back out to reconnect the immersive interior route with the full network silhouette.",
     vesselOpacity: 0.22,
     fogDensity: 0.15,
     pathOpacity: 0.06,
@@ -1990,9 +2579,10 @@ function weightedChoice(items, weightFn) {
   return items[items.length - 1];
 }
 
-const RBC_ROUTE_ALPHA = 1.0;
-const RBC_ROUTE_BETA = 0.45;
-const RBC_PHASE_GAIN = 0.55;
+const RBC_ROUTE_ALPHA = 1.12;
+const RBC_ROUTE_BETA = 0.28;
+const RBC_PHASE_GAIN = 0.4;
+const RBC_SKIMMING_GAIN = 0.5;
 const RBC_WAIT_MIN = 0.03;
 const RBC_WAIT_MAX = 0.11;
 
@@ -2009,7 +2599,7 @@ const edgeTargetWeightTotal = edgeTargetWeights.reduce((sum, value) => sum + val
 const edgeOccupancy = new Array(edgeRecords.length).fill(0);
 
 function desiredParticlesForEdge(edgeIndex) {
-  return particleCount * edgeTargetWeights[edgeIndex] / Math.max(edgeTargetWeightTotal, 1e-6);
+  return activeParticleCount() * edgeTargetWeights[edgeIndex] / Math.max(edgeTargetWeightTotal, 1e-6);
 }
 
 function occupancyBiasForEdge(edge) {
@@ -2051,7 +2641,9 @@ function nextEdgeFromNode(nodeIndex, previousEdge, options = {}) {
   const previousNode = previousEdge.a === nodeIndex ? previousEdge.b : previousEdge.a;
   const incoming = points[nodeIndex].clone().sub(points[previousNode]).normalize();
   const totalOutflow = candidates.reduce((sum, edge) => sum + Math.abs(edge.flow), 0);
+  const totalRbcFlux = candidates.reduce((sum, edge) => sum + Math.abs(edge.flow) * edgeDischargeHematocrit(edge), 0);
   const meanDiameter = candidates.reduce((sum, edge) => sum + edge.diamUm, 0) / Math.max(candidates.length, 1);
+  const meanFlowFraction = 1 / Math.max(candidates.length, 1);
 
   const chosen = weightedChoice(candidates, (edge) => {
     const other = edge.a === nodeIndex ? edge.b : edge.a;
@@ -2059,16 +2651,22 @@ function nextEdgeFromNode(nodeIndex, previousEdge, options = {}) {
     const alignment = clamp((incoming.dot(outgoing) + 1) * 0.5, 0, 1);
     const caliberMatch = Math.min(previousEdge.displayRadius, edge.displayRadius) / Math.max(previousEdge.displayRadius, edge.displayRadius, 1e-6);
     const flowProportion = totalOutflow > 0 ? Math.abs(edge.flow) / totalOutflow : edgeFlux(edge);
+    const rbcFluxShare = totalRbcFlux > 0
+      ? Math.abs(edge.flow) * edgeDischargeHematocrit(edge) / totalRbcFlux
+      : flowProportion;
     const continuity = profile ? profile.connectivityScore : 0.5;
-    const diameterBias = Math.pow(Math.max(edge.diamUm, 1e-4) / Math.max(meanDiameter, 1e-4), RBC_ROUTE_BETA);
-    const phaseBias = Math.pow(clamp(edge.diamUm / Math.max(meanDiameter, 1e-4), 0.58, 1.8), RBC_PHASE_GAIN);
+    const diameterRatio = Math.max(edge.diamUm, 1e-4) / Math.max(meanDiameter, 1e-4);
+    const diameterBias = Math.pow(diameterRatio, RBC_ROUTE_BETA);
+    const phaseBias = Math.pow(clamp(diameterRatio, 0.58, 1.8), RBC_PHASE_GAIN);
+    const skimmingBias = Math.pow(clamp(flowProportion / meanFlowFraction, 0.42, 2.4), RBC_SKIMMING_GAIN);
     const pressureBias = edgeFlowMatchesPressure(edge) ? 1.0 : 0.65;
     const occupancyBias = occupancyBiasForEdge(edge);
     return Math.max(
       0.01,
-      Math.pow(Math.max(flowProportion, 1e-5), RBC_ROUTE_ALPHA)
+      Math.pow(Math.max(rbcFluxShare, 1e-5), RBC_ROUTE_ALPHA)
         * diameterBias
         * phaseBias
+        * skimmingBias
         * (0.35 + alignment * 0.95)
         * (0.4 + caliberMatch * 0.6)
         * (0.52 + edge.speedNorm * 0.48)
@@ -2086,7 +2684,14 @@ function nextEdgeFromNode(nodeIndex, previousEdge, options = {}) {
   return { edge: chosen, from: nodeIndex, to: targetNode };
 }
 
-const particleCount = Math.min(720, Math.max(320, Math.floor(edgeRecords.length * 0.18)));
+let baseParticleCount = Math.max(360, Math.floor(edgeRecords.length * 0.01));
+let densityMultiplier = 1.0;
+let volumeMultiplier = 1.0;
+
+function activeParticleCount() {
+  return Math.max(60, Math.floor(baseParticleCount * densityMultiplier));
+}
+
 const particleStates = [];
 const offscreenPosition = new THREE.Vector3(999, 999, 999);
 const particleAxis = new THREE.Vector3(1, 0, 0);
@@ -2096,7 +2701,6 @@ const particleDirection = new THREE.Vector3();
 const particleNormal = new THREE.Vector3();
 const particleBinormal = new THREE.Vector3();
 const particleQuaternion = new THREE.Quaternion();
-const particleColor = new THREE.Color();
 
 function createRedBloodCellGeometry() {
   const geometry = new THREE.SphereGeometry(1, 18, 14);
@@ -2117,7 +2721,7 @@ function createRedBloodCellGeometry() {
 
 const redCellGeometry = createRedBloodCellGeometry();
 const redCellMaterial = new THREE.MeshPhysicalMaterial({
-  color: 0xffffff,
+  color: 0xff0000,
   roughness: 0.36,
   metalness: 0.0,
   clearcoat: 0.12,
@@ -2126,7 +2730,7 @@ const redCellMaterial = new THREE.MeshPhysicalMaterial({
   opacity: 0.94,
   depthWrite: false,
 });
-const particleCloud = new THREE.InstancedMesh(redCellGeometry, redCellMaterial, particleCount);
+const particleCloud = new THREE.InstancedMesh(redCellGeometry, redCellMaterial, baseParticleCount);
 particleCloud.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 particleCloud.frustumCulled = false;
 particleCloud.renderOrder = 4;
@@ -2138,7 +2742,6 @@ function hideParticle(index) {
   particleDummy.rotation.set(0, 0, 0);
   particleDummy.updateMatrix();
   particleCloud.setMatrixAt(index, particleDummy.matrix);
-  particleCloud.setColorAt(index, particleColor.setRGB(0, 0, 0));
 }
 
 function activateParticle(index, transition, spawnT = Math.random() * 0.22, tempo = 0.82 + Math.random() * 0.42) {
@@ -2153,12 +2756,12 @@ function activateParticle(index, transition, spawnT = Math.random() * 0.22, temp
   particleStates[index].t = spawnT;
   particleStates[index].tempo = tempo;
   particleStates[index].age = 0;
-  particleStates[index].roll = Math.random() * Math.PI * 2;
-  particleStates[index].rollRate = -1.4 + Math.random() * 2.8;
-  particleStates[index].laneAngle = Math.random() * Math.PI * 2;
-  particleStates[index].laneDrift = 0.45 + Math.random() * 0.95;
-  particleStates[index].laneRadius = Math.random() * Math.min(transition.edge.displayRadius * 0.28, data.visual.minDisplayRadius * 1.8);
-  particleStates[index].wobble = 0.8 + Math.random() * 0.9;
+  particleStates[index].roll = 0;
+  particleStates[index].rollRate = 0;
+  particleStates[index].laneAngle = 0;
+  particleStates[index].laneDrift = 0;
+  particleStates[index].laneRadius = 0;
+  particleStates[index].wobble = 0;
   particleStates[index].waitTimer = 0;
   particleStates[index].waitDuration = 0;
   particleStates[index].lingerT = 0;
@@ -2191,7 +2794,7 @@ function seedParticle(index) {
 
 function resetParticleSystem() {
   edgeOccupancy.fill(0);
-  for (let i = 0; i < particleCount; i += 1) {
+  for (let i = 0; i < baseParticleCount; i += 1) {
     particleStates[i] = {
       active: false,
       cooldown: 0,
@@ -2214,29 +2817,36 @@ function resetParticleSystem() {
     hideParticle(i);
   }
 
-  for (let i = 0; i < particleCount; i += 1) {
-    seedParticle(i);
+  for (let i = 0; i < baseParticleCount; i += 1) {
+    if (i < activeParticleCount()) {
+      seedParticle(i);
+    }
   }
 
   particleCloud.instanceMatrix.needsUpdate = true;
-  if (particleCloud.instanceColor) {
-    particleCloud.instanceColor.needsUpdate = true;
-  }
 }
 
 resetParticleSystem();
 
 function findDormantParticle(excludeIndex) {
-  for (let i = 0; i < particleCount; i += 1) {
+  let earliestAvailable = -1;
+  let minCooldown = Infinity;
+  for (let i = 0; i < activeParticleCount(); i += 1) {
     if (i === excludeIndex) {
       continue;
     }
     const state = particleStates[i];
-    if (state && !state.active && state.cooldown <= 0) {
-      return i;
+    if (state && !state.active) {
+      if (state.cooldown <= 0) {
+        return i;
+      }
+      if (state.cooldown < minCooldown) {
+        minCooldown = state.cooldown;
+        earliestAvailable = i;
+      }
     }
   }
-  return -1;
+  return earliestAvailable;
 }
 
 function spawnDormantParticleFromNode(nodeIndex, previousEdge, excludeIndex) {
@@ -2249,6 +2859,7 @@ function spawnDormantParticleFromNode(nodeIndex, previousEdge, excludeIndex) {
   if (!next) {
     return;
   }
+  particleStates[dormantIndex].cooldown = 0;
   activateParticle(dormantIndex, next, Math.random() * 0.08, 0.9 + Math.random() * 0.22);
 }
 
@@ -2270,47 +2881,39 @@ function updateParticleInstance(index, state) {
   particleNormal.addScaledVector(particleDirection, -particleNormal.dot(particleDirection)).normalize();
   particleBinormal.crossVectors(particleDirection, particleNormal).normalize();
 
-  const laneRadius = Math.min(
-    state.edge.displayRadius * 0.34,
-    Math.max(state.edge.displayRadius * 0.06, state.laneRadius),
-  );
-  const phase = state.laneAngle + state.age * state.laneDrift * (0.9 + state.edge.speedNorm * 1.4);
-  particlePosition
-    .addScaledVector(particleNormal, Math.cos(phase) * laneRadius)
-    .addScaledVector(particleBinormal, Math.sin(phase) * laneRadius * 0.72);
-
   particleQuaternion.setFromUnitVectors(particleAxis, particleDirection);
-  const baseSize = clamp(
-    state.edge.displayRadius * (0.34 + state.edge.hematocrit * 0.46),
-    data.particles.size * 0.82,
-    state.edge.displayRadius * 0.78,
+  
+  let baseSize = state.edge.displayRadius * 1.02;
+  
+  if (volumeMultiplier > 0 && state.edge.hematocrit > 0) {
+    const hctAbsolute = state.edge.hematocrit;
+    const volumeFactor = 0.5 + hctAbsolute * 1.15;
+    baseSize *= (1 + (volumeFactor - 1) * volumeMultiplier);
+  }
+  
+  baseSize = clamp(
+    baseSize,
+    state.edge.displayRadius,
+    state.edge.displayRadius * 1.08,
   );
 
   particleDummy.position.copy(particlePosition);
   particleDummy.quaternion.copy(particleQuaternion);
-  particleDummy.rotateX(state.roll + state.age * state.rollRate);
-  particleDummy.rotateZ(Math.sin(state.age * state.wobble * 3.2 + state.laneAngle) * 0.18);
-  particleDummy.scale.set(baseSize * 1.08, baseSize * 0.74, baseSize * 0.56);
+  particleDummy.scale.set(baseSize, baseSize * 1.35, baseSize * 0.82);
   particleDummy.updateMatrix();
   particleCloud.setMatrixAt(index, particleDummy.matrix);
-
-  particleColor
-    .set("#a61e16")
-    .lerp(samplePalette(state.edge.speedNorm), 0.58 + state.edge.speedNorm * 0.26)
-    .lerp(new THREE.Color("#ffe0d1"), 0.05 + state.edge.speedNorm * 0.08);
-  particleCloud.setColorAt(index, particleColor);
 }
 
 function updateParticles(dt) {
   edgeOccupancy.fill(0);
-  for (let i = 0; i < particleCount; i += 1) {
+  for (let i = 0; i < activeParticleCount(); i += 1) {
     const state = particleStates[i];
     if (state && state.active && state.edge) {
       edgeOccupancy[state.edge.index] += 1;
     }
   }
 
-  for (let i = 0; i < particleCount; i += 1) {
+  for (let i = 0; i < activeParticleCount(); i += 1) {
     const state = particleStates[i];
     if (!state || !state.active) {
       if (state) {
@@ -2348,9 +2951,9 @@ function updateParticles(dt) {
 
       if (profile.degree >= 3) {
         const deathProb = clamp(
-          profile.deathFactor * (0.74 + profile.anomaly * 0.28) + (profile.hardAnomaly ? 0.22 : 0.0),
+          profile.deathFactor * (0.35 + profile.anomaly * 0.15) + (profile.hardAnomaly ? 0.1 : 0.0),
           0,
-          profile.hardAnomaly ? 0.98 : 0.86,
+          profile.hardAnomaly ? 0.5 : 0.35,
         );
         if (Math.random() < deathProb) {
           deactivateParticle(i, 0.08 + Math.random() * 0.22);
@@ -2369,8 +2972,8 @@ function updateParticles(dt) {
       state.edge = next.edge;
       state.from = next.from;
       state.to = next.to;
-      state.laneRadius = Math.min(state.laneRadius, state.edge.displayRadius * 0.34);
-      state.laneAngle += (Math.random() - 0.5) * 0.72;
+      state.laneRadius = 0;
+      state.laneAngle = 0;
       localT = 0;
 
       if (profile.degree >= 3) {
@@ -2381,11 +2984,11 @@ function updateParticles(dt) {
         state.lingerT = Math.random() * 0.012;
       }
 
-      if (profile.degree >= 3 && profile.birthFactor > 0.03) {
+      if (profile.degree >= 3 && profile.birthFactor > 0.01) {
         const spawnProb = clamp(
-          profile.birthFactor * (0.34 + profile.connectivityScore * 0.66) * (profile.outgoingEdges.length > 1 ? 1.12 : 0.72),
+          profile.birthFactor * (0.5 + profile.connectivityScore * 0.5) * (profile.outgoingEdges.length > 1 ? 1.2 : 0.8),
           0,
-          profile.hardAnomaly ? 0.2 : 0.74,
+          profile.hardAnomaly ? 0.3 : 0.8,
         );
         if (Math.random() < spawnProb) {
           spawnDormantParticleFromNode(arrivalNode, state.edge, i);
@@ -2402,21 +3005,21 @@ function updateParticles(dt) {
   }
 
   particleCloud.instanceMatrix.needsUpdate = true;
-  if (particleCloud.instanceColor) {
-    particleCloud.instanceColor.needsUpdate = true;
-  }
 }
 
 const state = {
   playing: true,
   autoCamera: true,
   progress: 0,
-  speedMultiplier: 1.0,
+  speedMultiplier: 0.45,
   durationSeconds: data.visual.tourDurationSeconds,
   activePhaseKey: "top-overview",
   smoothPosition: camera.position.clone(),
   smoothLookAt: new THREE.Vector3(0, 0, 0),
   smoothUp: new THREE.Vector3(0, 1, 0),
+  viewMode: "combined",
+  localInspectPoint: null,
+  localInspectRadius: 0.3,
 };
 const manualOrbit = {
   active: false,
@@ -2512,6 +3115,19 @@ restartBtn.addEventListener("click", () => {
   syncButtons();
 });
 
+axesBtn.addEventListener("click", () => {
+  axesHelper.visible = !axesHelper.visible;
+  axesBtn.classList.toggle("active", axesHelper.visible);
+});
+
+startRecordBtn.addEventListener("click", () => {
+  startRecording();
+});
+
+stopRecordBtn.addEventListener("click", () => {
+  stopRecording();
+});
+
 phaseButtons.forEach((button) => {
   button.addEventListener("click", () => {
     state.playing = false;
@@ -2521,12 +3137,94 @@ phaseButtons.forEach((button) => {
   });
 });
 
+const modeButtons = Array.from(document.querySelectorAll(".mode-btn"));
+const modeReadout = document.getElementById("modeReadout");
+
+function setViewMode(mode) {
+  state.viewMode = mode;
+  modeButtons.forEach((button) => {
+    button.classList.toggle("active", button.dataset.mode === mode);
+  });
+  modeReadout.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
+  applyViewColorMode(mode);
+}
+
+modeButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    setViewMode(button.dataset.mode);
+  });
+});
+
+applyViewColorMode(state.viewMode);
+
 const infoPanel = document.getElementById("infoPanel");
 const infoIcon = document.getElementById("infoIcon");
 const infoTitle = document.getElementById("infoTitle");
 const infoSubtitle = document.getElementById("infoSubtitle");
 const infoGrid = document.getElementById("infoGrid");
 const infoCloseBtn = document.getElementById("infoCloseBtn");
+
+function formatNetworkValue(value, digits = 3) {
+  if (value == null || Number.isNaN(value)) {
+    return "N/A";
+  }
+  return Number(value).toFixed(digits);
+}
+
+function showNetworkSummary() {
+  if (!networkSummary) {
+    return;
+  }
+  const diagnostics = data.network || {};
+  const agreement = diagnostics.flowPressureAgreement == null
+    ? "N/A"
+    : `${(diagnostics.flowPressureAgreement * 100).toFixed(0)}%`;
+  const correlation = diagnostics.flowPressureCorrelation == null
+    ? "N/A"
+    : diagnostics.flowPressureCorrelation.toFixed(3);
+  const hctRange = diagnostics.hematocritMean == null
+    ? "N/A"
+    : `${diagnostics.hematocritMean.toFixed(3)} (${diagnostics.hematocritMin.toFixed(3)}-${diagnostics.hematocritMax.toFixed(3)})`;
+  const boundingBox = new THREE.Box3();
+  points.forEach((point) => boundingBox.expandByPoint(point));
+  const center = boundingBox.getCenter(new THREE.Vector3());
+  const size = boundingBox.getSize(new THREE.Vector3());
+  const scale = data.stats?.scale ?? 1;
+  networkSummary.innerHTML = `
+    <div class="network-row">
+      <span class="network-label">Agreement</span>
+      <span class="network-value">${agreement}</span>
+    </div>
+    <div class="network-row">
+      <span class="network-label">Median dP/dL</span>
+      <span class="network-value">${formatNetworkValue(diagnostics.pressureGradientMedian, 4)}</span>
+    </div>
+    <div class="network-row">
+      <span class="network-label">P90 dP/dL</span>
+      <span class="network-value">${formatNetworkValue(diagnostics.pressureGradientP90, 4)}</span>
+    </div>
+    <div class="network-row">
+      <span class="network-label">Flow-Gradient r</span>
+      <span class="network-value">${correlation}</span>
+    </div>
+    <div class="network-row">
+      <span class="network-label">Hematocrit</span>
+      <span class="network-value">${hctRange}</span>
+    </div>
+    <div class="network-row">
+      <span class="network-label">Model Center</span>
+      <span class="network-value">(${center.x.toFixed(3)}, ${center.y.toFixed(3)}, ${center.z.toFixed(3)})</span>
+    </div>
+    <div class="network-row">
+      <span class="network-label">Model Extent</span>
+      <span class="network-value">${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}</span>
+    </div>
+    <div class="network-row">
+      <span class="network-label">Scale Factor</span>
+      <span class="network-value">${scale.toFixed(2)}</span>
+    </div>
+  `;
+}
 
 function showNodeInfo(nodeIndex) {
   const profile = nodeFlowProfiles[nodeIndex];
@@ -2628,41 +3326,34 @@ function showVesselInfo(edgeIndex) {
   if (!edge) return;
 
   const flowDirection = `${edge.preferredStart} -> ${edge.preferredEnd}`;
-  const averagePressure = edge.pressureStart == null || edge.pressureEnd == null
-    ? null
-    : (edge.pressureStart + edge.pressureEnd) * 0.5;
+
+  const startPoint = points[edge.a];
+  const endPoint = points[edge.b];
 
   infoIcon.className = "info-icon vessel";
   infoIcon.textContent = "↔";
   infoTitle.textContent = `Vessel #${edgeIndex}`;
-  const startPoint = points[edge.a];
-  const endPoint = points[edge.b];
-  infoSubtitle.textContent = `Node #${edge.a} -> Node #${edge.b}`;
-
+  infoSubtitle.textContent = "";
   infoGrid.innerHTML = `
     <div class="info-row">
       <span class="info-label">Start Node</span>
-      <span class="info-value">Node #${edge.a}</span>
-    </div>
-    <div class="info-row">
-      <span class="info-label">Start Coordinates</span>
-      <span class="info-value">${startPoint.x.toFixed(3)}, ${startPoint.y.toFixed(3)}, ${startPoint.z.toFixed(3)}</span>
+      <span class="info-value">Node #${edge.a} (${startPoint.x.toFixed(3)},${startPoint.y.toFixed(3)},${startPoint.z.toFixed(3)})</span>
     </div>
     <div class="info-row">
       <span class="info-label">End Node</span>
-      <span class="info-value">Node #${edge.b}</span>
-    </div>
-    <div class="info-row">
-      <span class="info-label">End Coordinates</span>
-      <span class="info-value">${endPoint.x.toFixed(3)}, ${endPoint.y.toFixed(3)}, ${endPoint.z.toFixed(3)}</span>
+      <span class="info-value">Node #${edge.b} (${endPoint.x.toFixed(3)},${endPoint.y.toFixed(3)},${endPoint.z.toFixed(3)})</span>
     </div>
     <div class="info-row">
       <span class="info-label">Diameter</span>
       <span class="info-value">${edge.diamUm.toFixed(2)} μm</span>
     </div>
     <div class="info-row">
-      <span class="info-label">Radius</span>
-      <span class="info-value">${edge.radiusUm.toFixed(2)} μm</span>
+      <span class="info-label">Path Length</span>
+      <span class="info-value">${edge.pathLengthRaw.toFixed(3)}</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">Tortuosity</span>
+      <span class="info-value">${edge.tortuosity.toFixed(3)}</span>
     </div>
     <div class="info-row">
       <span class="info-label">Flow Rate</span>
@@ -2679,18 +3370,12 @@ function showVesselInfo(edgeIndex) {
       <span class="info-value">${edge.speed.toFixed(3)} mm/s</span>
     </div>
     <div class="info-row">
-      <span class="info-label">Velocity Tint</span>
-      <span class="info-value ${edge.speedNorm > 0.66 ? 'highlight' : edge.speedNorm > 0.33 ? 'warning' : 'success'}">
-        ${(edge.speedNorm * 100).toFixed(0)}%
-      </span>
-    </div>
-    <div class="info-row">
       <span class="info-label">Hematocrit</span>
       <span class="info-value">${edge.hematocrit.toFixed(3)}</span>
     </div>
     <div class="info-row">
       <span class="info-label">Shear Stress</span>
-      <span class="info-value">${edge.shearStress.toFixed(4)}</span>
+      <span class="info-value">${Math.abs(edge.shearStress).toFixed(4)}</span>
     </div>
     <div class="info-row">
       <span class="info-label">Pressure Start</span>
@@ -2701,8 +3386,8 @@ function showVesselInfo(edgeIndex) {
       <span class="info-value">${edge.pressureEnd == null ? 'N/A' : edge.pressureEnd.toFixed(4)}</span>
     </div>
     <div class="info-row">
-      <span class="info-label">Average Pressure</span>
-      <span class="info-value">${averagePressure == null ? 'N/A' : averagePressure.toFixed(4)}</span>
+      <span class="info-label">Pressure Drop</span>
+      <span class="info-value">${edge.pressureDrop == null ? 'N/A' : edge.pressureDrop.toFixed(4)}</span>
     </div>
   `;
 
@@ -2714,6 +3399,7 @@ function closeInfoPanel() {
 }
 
 infoCloseBtn.addEventListener("click", closeInfoPanel);
+showNetworkSummary();
 
 function handleClick(event) {
   const rect = renderer.domElement.getBoundingClientRect();
@@ -2724,15 +3410,6 @@ function handleClick(event) {
 
   const raycaster = new THREE.Raycaster();
   raycaster.setFromCamera(mouse, camera);
-
-  const branchIntersects = raycaster.intersectObject(branchMesh);
-  if (branchIntersects.length > 0) {
-    const index = branchIntersects[0].instanceId;
-    if (index !== undefined && branchNodes[index] !== undefined) {
-      showNodeInfo(branchNodes[index]);
-      return;
-    }
-  }
 
   const intersects = raycaster.intersectObjects(vesselGroup.children, true);
   
@@ -2753,9 +3430,12 @@ function handleClick(event) {
 
     if (closestEdge !== null && closestDistance < 0.05) {
       showVesselInfo(closestEdge);
+      state.localInspectPoint = point.clone();
       return;
     }
   }
+
+  state.localInspectPoint = null;
 
   closeInfoPanel();
 }
@@ -2841,6 +3521,27 @@ speedSlider.addEventListener("input", (event) => {
   speedReadout.textContent = `${state.speedMultiplier.toFixed(1)}x`;
 });
 
+densitySlider.addEventListener("input", (event) => {
+  densityMultiplier = Number(event.target.value) / 100;
+  densityReadout.textContent = `${event.target.value}%`;
+});
+
+particleCountSlider.addEventListener("input", (event) => {
+  const value = Number(event.target.value);
+  if (value === 0) {
+    particleCountReadout.textContent = "Auto";
+   baseParticleCount = Math.max(360, Math.floor(edgeRecords.length * 0.1));
+  } else {
+    particleCountReadout.textContent = value.toLocaleString();
+    baseParticleCount = value;
+  }
+});
+
+volumeSlider.addEventListener("input", (event) => {
+  volumeMultiplier = Number(event.target.value) / 100;
+  volumeReadout.textContent = volumeMultiplier > 0 ? "On" : "Off";
+});
+
 const clock = new THREE.Clock();
 
 function renderViewerFrame(dt, progressOverride = null) {
@@ -2852,26 +3553,68 @@ function renderViewerFrame(dt, progressOverride = null) {
   const targets = getTourTargets(state.progress);
 
   if (state.autoCamera) {
-    const follow = 1 - Math.exp(-dt * 6.0);
-    const orient = 1 - Math.exp(-dt * 5.0);
-    state.smoothPosition.lerp(targets.position, follow);
-    state.smoothLookAt.lerp(targets.lookAt, orient);
-    state.smoothUp.lerp(targets.up, orient).normalize();
+    const targetFov = targets.targetFov || 54;
+    if (Math.abs(camera.fov - targetFov) > 0.1) {
+      camera.fov += (targetFov - camera.fov) * (1 - Math.exp(-dt * 3.5));
+      camera.updateProjectionMatrix();
+    }
+
+    if (targets.isInterior) {
+      const follow = 1 - Math.exp(-dt * 3.0);
+      const orient = 1 - Math.exp(-dt * 2.4);
+      state.smoothPosition.lerp(targets.position, follow);
+      state.smoothLookAt.lerp(targets.lookAt, orient);
+      state.smoothUp.copy(worldUp);
+    } else {
+      const follow = 1 - Math.exp(-dt * 6.0);
+      const orient = 1 - Math.exp(-dt * 5.0);
+      state.smoothPosition.lerp(targets.position, follow);
+      state.smoothLookAt.lerp(targets.lookAt, orient);
+      state.smoothUp.lerp(targets.up, orient).normalize();
+    }
 
     camera.position.copy(state.smoothPosition);
-    camera.up.copy(state.smoothUp);
+    camera.up.set(0, 1, 0);
     camera.lookAt(state.smoothLookAt);
   }
 
-  vesselMaterial.opacity += (targets.vesselOpacity - vesselMaterial.opacity) * (1 - Math.exp(-dt * 4.0));
-  coreLineMaterial.opacity += (Math.max(0.05, targets.vesselOpacity * 0.28) - coreLineMaterial.opacity) * (1 - Math.exp(-dt * 3.2));
+  let targetVesselOpacity = targets.vesselOpacity;
+  let targetCoreLineOpacity = Math.max(0.05, targets.vesselOpacity * 0.28);
+  let targetParticleOpacity = 1.0;
+
+  switch (state.viewMode) {
+    case "velocity":
+      targetParticleOpacity = 1.0;
+      particleCloud.visible = true;
+      break;
+    case "combined":
+      targetVesselOpacity = 0.28;
+      targetCoreLineOpacity = 0.22;
+      targetParticleOpacity = 0.85;
+      particleCloud.visible = true;
+      break;
+    case "local":
+      targetVesselOpacity = 0.18;
+      targetCoreLineOpacity = 0.12;
+      targetParticleOpacity = 0.35;
+      particleCloud.visible = true;
+      break;
+    default:
+      break;
+  }
+
+  vesselMaterial.opacity += (targetVesselOpacity - vesselMaterial.opacity) * (1 - Math.exp(-dt * 4.0));
+  coreLineMaterial.opacity += (targetCoreLineOpacity - coreLineMaterial.opacity) * (1 - Math.exp(-dt * 3.2));
   pathMaterial.opacity += (targets.pathOpacity - pathMaterial.opacity) * (1 - Math.exp(-dt * 4.5));
   scene.fog.density += (targets.fogDensity - scene.fog.density) * (1 - Math.exp(-dt * 3.8));
   hubHalo.material.opacity += (targets.hubOpacity - hubHalo.material.opacity) * (1 - Math.exp(-dt * 3.8));
   hubHalo.scale.setScalar(1.0 + Math.sin(state.progress * Math.PI * 12.0) * 0.04);
   dust.rotation.y += dt * 0.02;
 
-  updateBranchMarkers(state.autoCamera ? state.smoothLookAt : camera.position);
+  if (particleCloud.material) {
+    particleCloud.material.opacity = targetParticleOpacity;
+  }
+
   updateParticles(dt);
   syncButtons();
   renderer.render(scene, camera);
@@ -2912,11 +3655,28 @@ function withExportRandom(callback) {
 
 window.viewerExport = {
   ready: true,
+  setSurface(options = {}) {
+    const exportWidth = Number.isFinite(options.width) ? Math.max(1, Math.floor(options.width)) : window.innerWidth;
+    const exportHeight = Number.isFinite(options.height) ? Math.max(1, Math.floor(options.height)) : window.innerHeight;
+    const supersample = Number.isFinite(options.supersample) ? Math.max(1, options.supersample) : 1;
+    exportSurfaceActive = true;
+    setRenderSurface(
+      Math.max(1, Math.round(exportWidth * supersample)),
+      Math.max(1, Math.round(exportHeight * supersample)),
+      1,
+      false,
+    );
+  },
+  restoreSurface() {
+    exportSurfaceActive = false;
+    setRenderSurface(window.innerWidth, window.innerHeight, defaultPixelRatio);
+  },
   reset(options = {}) {
     const seed = Number.isFinite(options.seed) ? options.seed : 12345;
     exportRandomGenerator = createSeededRandom(seed);
     state.playing = false;
     restoreAutoCamera();
+    this.setSurface(options);
     closeInfoPanel();
     dust.rotation.set(0, 0, 0);
     hubHalo.scale.setScalar(1.0);
@@ -2939,6 +3699,7 @@ window.viewerExport = {
     return withExportRandom(() => {
       state.playing = false;
       restoreAutoCamera();
+      this.setSurface(options);
       renderViewerFrame(dt, progress);
       return renderer.domElement.toDataURL("image/png");
     });
@@ -2947,18 +3708,79 @@ window.viewerExport = {
     if (!exportRandomGenerator) {
       this.reset(options);
     }
+    this.setSurface(options);
     return renderer.domElement.toDataURL("image/png");
   },
 };
 
 window.addEventListener("resize", () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  if (!exportSurfaceActive) {
+    setRenderSurface(window.innerWidth, window.innerHeight, defaultPixelRatio);
+  }
   if (!state.autoCamera) {
     applyManualOrbitCamera();
   }
 });
+
+function startRecording() {
+  const canvas = renderer.domElement;
+  const stream = canvas.captureStream(30);
+  
+  const options = {
+    mimeType: "video/webm;codecs=vp9",
+    videoBitsPerSecond: 15000000
+  };
+  
+  mediaRecorder = new MediaRecorder(stream, options);
+  recordedChunks = [];
+  
+  mediaRecorder.ondataavailable = (event) => {
+    if (event.data.size > 0) {
+      recordedChunks.push(event.data);
+    }
+  };
+  
+  mediaRecorder.onstop = () => {
+    const blob = new Blob(recordedChunks, { type: "video/webm" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `lc_3_recording_${Date.now()}.webm`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+  
+  mediaRecorder.start();
+  recordingStartTime = Date.now();
+  recordingOverlay.classList.add("visible");
+  startRecordBtn.disabled = true;
+  startRecordBtn.textContent = "Recording...";
+  
+  recordingInterval = setInterval(() => {
+    const elapsed = Date.now() - recordingStartTime;
+    const minutes = Math.floor(elapsed / 60000);
+    const seconds = Math.floor((elapsed % 60000) / 1000);
+    recordingTime.textContent = `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+  }, 1000);
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
+  }
+  
+  if (recordingInterval) {
+    clearInterval(recordingInterval);
+    recordingInterval = null;
+  }
+  
+  recordingOverlay.classList.remove("visible");
+  startRecordBtn.disabled = false;
+  startRecordBtn.textContent = "Start Record";
+  recordingTime.textContent = "00:00";
+}
 
 applyCameraTarget(0);
 syncButtons();
@@ -2968,113 +3790,37 @@ animate();
 </html>"""
 
 
-def main():
-    points_raw, cells, point_scalars, cell_scalars = read_legacy_vtk_polydata(VTK_FILE)
+def main(input_vtk: Path, output_html: Path):
+    viewer_data, summary = build_viewer_data(input_vtk)
+    html = render_viewer_html(viewer_data)
+    output_html.write_text(html, encoding="utf-8")
+    print("\n".join([f"Wrote {output_html}", *summary]))
 
-    velocity = cell_scalars.get("velocity_mm_s")
-    if velocity is None:
-        raise RuntimeError("velocity_mm_s not found in CELL_DATA.")
-    flow_nl_min = cell_scalars.get("flow_nl_min")
-    hematocrit = cell_scalars.get("hematocrit")
-    shear_stress = cell_scalars.get("shear_stress")
-    point_pressure = point_scalars.get("pressure")
 
-    radius_um = cell_scalars.get("radius_um")
-    diam_um = cell_scalars.get("diam_um")
-    if radius_um is None:
-        if diam_um is not None:
-            radius_um = diam_um / 2.0
-        else:
-            radius_um = np.full(len(cells), 4.0, dtype=float)
-    if diam_um is None:
-        diam_um = radius_um * 2.0
-
-    points_norm, center, scale = normalize_points(points_raw)
-    segments = build_segments(
-        cells,
-        points_raw,
-        velocity,
-        radius_um,
-        flow_nl_min=flow_nl_min,
-        hematocrit=hematocrit,
-        diam_um=diam_um,
-        shear_stress=shear_stress,
-        point_pressure=point_pressure,
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate an interactive velocity viewer HTML from VTK polydata."
     )
-    adjacency = build_adjacency(segments)
-
-    speed = np.abs(velocity)
-    robust_max = float(np.percentile(speed, 98))
-    if robust_max <= 0:
-        robust_max = float(np.max(speed))
-    if robust_max <= 0:
-        robust_max = 1.0
-
-    scene_data = colorized_data(points_norm, segments, robust_max, scale)
-    render_strands = build_render_strands(points_norm, segments, robust_max, scale)
-    tour = choose_tour(points_raw, points_norm, adjacency, segments, scale)
-
-    median_edge_length_norm = scene_data["median_edge_length_norm"]
-    radius_boost = 1.85 if scene_data["median_radius_norm"] <= 0 else max(1.4, min(2.3, median_edge_length_norm / scene_data["median_radius_norm"] * 0.55))
-    tour_duration = float(np.clip(tour["path_length_raw"] / 185.0, 30.0, 44.0))
-
-    viewer_data = {
-        "points": scene_data["points"],
-        "edges": scene_data["edges"],
-        "pointPressure": None if point_pressure is None else [round(float(v), 6) for v in point_pressure],
-        "vesselStrands": render_strands,
-        "cameraPath": [[round(float(v), 6) for v in row] for row in tour["camera_path_norm"]],
-        "focusPath": [[round(float(v), 6) for v in row] for row in tour["focus_path_norm"]],
-        "branchPoints": [[round(float(v), 6) for v in row] for row in tour["branch_points"]],
-        "branchNodes": [int(v) for v in tour["branch_nodes"]],
-        "branchStrengths": [round(float(v), 6) for v in tour["branch_strengths"]],
-        "hubPoint": [round(float(v), 6) for v in tour["hub_point"]],
-        "stats": {
-            "pointCount": int(len(points_raw)),
-            "cellCount": int(len(cells)),
-            "segmentCount": int(len(segments)),
-            "branchCount": int(tour["branch_count"]),
-            "endpointCount": int(tour["endpoint_count"]),
-            "velocityMin": float(np.min(velocity)),
-            "velocityMax": float(np.max(velocity)),
-            "robustMax": robust_max,
-            "pressureMin": None if point_pressure is None else float(np.min(point_pressure)),
-            "pressureMax": None if point_pressure is None else float(np.max(point_pressure)),
-            "tourLengthRaw": float(tour["path_length_raw"]),
-            "scale": scale,
-        },
-        "visual": {
-            "radiusBoost": round(float(radius_boost), 6),
-            "minDisplayRadius": round(float(scene_data["min_display_radius"]), 6),
-            "tourDurationSeconds": round(tour_duration, 3),
-            "cameraClearance": round(float(tour["camera_clearance"]), 6),
-        },
-        "particles": {
-            "sceneSpeedScale": round(float(1000.0 / scale * 0.17), 6),
-            "size": round(float(scene_data["min_display_radius"] * 2.1), 6),
-        },
-        "fields": {
-            "pointScalars": sorted(point_scalars.keys()),
-            "cellScalars": sorted(cell_scalars.keys()),
-        },
-    }
-
-    html = HTML_TEMPLATE.replace("__VIEWER_DATA__", json.dumps(viewer_data, separators=(",", ":")))
-    OUT_HTML.write_text(html, encoding="utf-8")
-
-    summary = [
-        f"Wrote {OUT_HTML}",
-        f"Points: {len(points_raw)} | Cells: {len(cells)} | Segments: {len(segments)}",
-        f"Renderable strands: {len(render_strands)}",
-        f"Branch points: {tour['branch_count']} | Endpoints: {tour['endpoint_count']}",
-        f"Velocity range: {float(np.min(velocity)):.4g} to {float(np.max(velocity)):.4g} mm/s",
-        f"Robust |velocity| max (98th percentile): {robust_max:.4g} mm/s",
-        f"Camera path length: {tour['path_length_raw']:.1f} raw units",
-        f"Point fields: {', '.join(sorted(point_scalars.keys())) or 'none'}",
-        f"Cell fields: {', '.join(sorted(cell_scalars.keys())) or 'none'}",
-    ]
-    print("\n".join(summary))
+    parser.add_argument(
+        "--input",
+        "-i",
+        type=Path,
+        default=DEFAULT_VTK_FILE,
+        help=f"Input VTK file (default: {DEFAULT_VTK_FILE.name})",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        default=DEFAULT_OUT_HTML,
+        help=f"Output HTML file (default: {DEFAULT_OUT_HTML.name})",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(
+        input_vtk=args.input,
+        output_html=args.output,
+    )
